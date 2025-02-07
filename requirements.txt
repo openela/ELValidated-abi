@@ -16,7 +16,7 @@ charset-normalizer==3.3.2
 click==8.1.7
 click-plugins==1.1.1
 crypt_r==3.13.1
-cryptography==43.0.0
+cryptography==43.0.1
 cson==0.8
 cssselect==1.1.0
 cupshelpers==1.0
