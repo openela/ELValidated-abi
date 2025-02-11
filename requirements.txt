@@ -124,7 +124,7 @@ selinux @ file:///builddir/build/BUILD/libselinux-3.7-build/libselinux-3.7/src
 Send2Trash==1.8.3
 sepolicy @ file:///builddir/build/BUILD/policycoreutils-3.7-build/selinux-3.7/python/sepolicy
 setools==4.5.1
-setuptools==69.2.0
+setuptools==70.0.0
 shtab==1.7.1
 simpleaudio==1.0.4
 simpleline==1.9.0
