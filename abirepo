@@ -1,0 +1,380 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# Copyright (C) 2025 Oracle, Inc.
+
+import argparse
+import libarchive
+import logging
+import git
+import tempfile
+import subprocess
+import rpmfile
+import os
+import re
+
+# globals
+args = None
+
+# Return codes from this script
+# Given RPM is processed and added
+ALLOK = 0
+# Other error or internal error
+EOTHER = 1
+
+# Internal error codes
+OK = 0
+NODSO = 1
+MISSINGFILE = 2
+
+def get_temp_directory():
+    """Determine an appropriate temporary directory to do
+    intermediate processing based on environment."""
+
+    # Check if ABITMPDIR environment variable is set
+    tmp_dir = os.environ.get('ABITMPDIR')
+    if tmp_dir:
+        logging.debug(f"Using ABITMPDIR environment variable"
+                      f" for intermediate processing: {tmp_dir}")
+        return tmp_dir
+
+    # Check if /tmp exists
+    if os.path.exists('/tmp'):
+        logging.debug(f"Using /tmp directory for intermediate processing")
+        return '/tmp'
+
+    # Default to current working directory
+    tmp_dir = os.getcwd()
+    logging.debug(f"Using current working directory"
+                  f" for intermediate processing: {tmp_dir}")
+    return tmp_dir
+
+def extract_rpm(archive, temporary_dir):
+    """Extracts an RPM archive to a temporary directory.
+
+    Args:
+        archive (str): Path to the RPM archive.
+
+    Returns:
+        str: Path to the extracted directory.
+    """
+
+    logging.debug(f"Extract {archive} to {temporary_dir}")
+    try:
+        # First command: rpm2cpio ARCHIVE
+        rpm2cpio_process = subprocess.Popen(["rpm2cpio", archive],
+                                            stdout=subprocess.PIPE)
+
+        # Second command: cpio -idmvD TMPDIR, reading from the
+        # first command's output
+        cpio_process = subprocess.Popen(["cpio", "--quiet", "-idmD", temporary_dir],
+                                        stdin=rpm2cpio_process.stdout)
+
+        # Close the output of rpm2cpio to leti the cpio process knowi
+        # no more data will be piped in
+        rpm2cpio_process.stdout.close()
+
+        # Wait for the cpio command to finish
+        cpio_process.communicate()
+
+        logging.debug(f"Extraction completed.")
+        return temporary_dir
+
+    except subprocess.CalledProcessError as err:
+        logging.error(f"An error occurred during extraction: {err}")
+        return None
+
+
+def extract_rpm_metadata(rpm_path):
+    """Extracts RPM metadata (name, version, release, architecture,
+    vendor).
+
+    Args:
+        rpm_path (str): Path to the RPM file.
+
+    Returns:
+        tuple: Contains the name, version, release, architecture,
+               and vendor of the RPM.
+    """
+    try:
+        # Open the RPM file
+        with rpmfile.open(rpm_path) as rpm:
+            # Extract required fields
+            name = rpm.headers.get('name').decode("utf-8")
+            version = rpm.headers.get('version').decode("utf-8")
+            release = rpm.headers.get('release').decode("utf-8")
+            architecture = rpm.headers.get('arch').decode("utf-8")
+            vendor = rpm.headers.get('vendor').decode("utf-8").partition(' ')[0]
+
+        return name, version, release, architecture, vendor
+    except Exception as e:
+        logging.error(f"Error reading RPM file: {e}")
+        return None
+
+def get_public_dso_sonames_set(rpm_file):
+    """Build a set of public DSOs as advertised in the package's
+    'provides' property.
+
+    Args:
+        rpm_file (str): binary RPM file.
+
+    Returns:
+        list[str]: Sorted, unique list of public DSOs.
+    """
+    try:
+        # Run the command to get the provides information from the RPM
+        result = subprocess.run(
+            ["rpm", "-qp", "--provides", rpm_file, "--nosignature"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+
+        # Filter lines containing '.so', extract relevant part, and
+        # process the output
+        provides = result.stdout.splitlines()
+        libraries = set()
+        for line in provides:
+            if ".so" in line:
+                # Extract part before '(' and trim whitespace
+                library = line.split("(")[0].strip()
+                libraries.add(library)
+
+        return sorted(libraries)
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Error executing rpm command: {e}")
+        return []
+    except Exception as e:
+        logging.error(f"Unexpected error: {e}")
+        return []
+
+def default_dbginfo_name(rpm_path):
+    """Use the input RPM to derive its coresponding debuginfo RPM
+
+    Returns: None or the debuginfo RPM
+    """
+
+    name, version, release, architecture, vendor = extract_rpm_metadata (rpm_path)
+    rpmdir = os.path.dirname (rpm_path)
+    if not rpmdir:
+        rpmdir = "."
+    dbginfo = (rpmdir + "/" + name + "-debuginfo-" +
+               version + "-" + release + "." +
+               architecture + ".rpm")
+
+    if not os.path.isfile(dbginfo):
+        logging.error (f"RPM file {dbginfo} does not exist")
+        return None
+    return dbginfo
+
+def generate_rpm_abixml(rpm_path, temporary_dir, dbginfo=None):
+    """Processes a binary RPM file, extracting matching .so files and
+    generating its ABIXML file, namely the ABI of the RPM.
+
+    Args:
+        rpm_path (str): Path to the binary RPM file.
+
+    Returns:
+        bytes: The output of the ABIXML processing.
+    """
+
+    if not os.path.isfile (rpm_path):
+        logging.error (f"Error reading RPM file: {rpm_path}")
+        return MISSINGFILE, None
+
+    # If there is no debuginfo RPM argument given, infer its name
+    # from the binary RPM name
+    if not dbginfo:
+        dbginfo = default_dbginfo_name(rpm_path)
+
+    # Expand debuginfo RPM
+    debuginfo_rootdir = extract_rpm (dbginfo, temporary_dir)
+    # Get full path to debuginfo
+    dbg_dir = os.path.join(debuginfo_rootdir, "usr", "lib", "debug")
+
+    # Expand binary RPM
+    elf_dir = extract_rpm (rpm_path, temporary_dir)
+
+    # Get the list of public DSOs
+    dso_list = get_public_dso_sonames_set(rpm_path)
+
+    # List to store relative paths of matching files
+    matching_files = []
+
+    # Build regular expression to match for shared libs names
+    rf = re.compile(r"\.so(\.\d+)*$")
+
+    # Walk through the tree of the expanded binary RPM
+    # processing the shared libaries only.
+    # Skip over private shared libraries (they are not part of the ABI)
+    for root, dirs, files in os.walk(elf_dir):
+        dirs[:] = [d for d in dirs if not d[0] == '.']
+        for file in files:
+            logging.debug(f"Processing file {file}")
+            file_path = os.path.join(root, file)
+            # Calculate the relative path and add it to the list
+            relative_path = os.path.relpath(file_path, elf_dir)
+            if rf.search(file):
+                if file in dso_list:
+                    logging.debug(f"Adding DSO file {file}")
+                    matching_files.append(relative_path)
+                else:
+                    logging.debug (f"DSO {file} seems to be private. Skipping it")
+
+    if matching_files:
+        all_so = ",".join(matching_files[:-1]) if len(matching_files) > 1 else matching_files[0]
+    else:
+        logging.info (f"No shared libaries in RPM to process")
+        return NODSO, None
+
+    # Now that we have a list of public shared libraries, run abidw to get the ABIXML
+
+    # Libabigail's ABIDW program reads a shared library (or a list of shared libraries) in ELF 
+    # format and emits an XML representation of its ABI to standard output. 
+    # The emitted representation format, named ABIXML, includes all the globally defined functions
+    # and variables, along with a complete representation of their types. 
+
+    cmdline = [args.abidw, "--no-corpus-path", "--debug-info-dir", dbg_dir,
+               "--add-binaries=" + all_so, matching_files[-1] ]
+    logging.debug(f"Running {cmdline}")
+    result = subprocess.run (cmdline, cwd=elf_dir, # Hack for abidw to work with multiple bins
+                             capture_output = True, check = False)
+    if (result.returncode != 0):
+        logging.error(f"abidw error:\n{result.stdout.decode('utf-8')}\n{result.stderr.decode('utf-8')}")
+        raise RuntimeError(f"abidw failure {result.returncode} {rpm_path}")
+
+    if len(result.stderr) > 0:
+        logging.warning(f"abidw error:{rpm_path}\n{result.stderr}")
+
+    return OK, result.stdout
+
+def do_add(gitrepo, gitbranch, rpmfile, temporary_dir, dbg=None):
+    """Submit package to git
+    """
+
+    # Canonicalize Git path
+    repo_path = os.path.realpath(gitrepo)
+
+    # Check if the repo given on the command line actually exists
+    if not os.path.exists(repo_path):
+        logging.error (f"Git repo {gitrepo} does not exist")
+        return EOTHER
+
+    # Open the git repo
+    abixml_repo = git.Repo(repo_path)
+    logging.debug(f'Opened git repo {gitrepo}')
+
+    # If the branch exists, do a checkout of it
+    if gitbranch in abixml_repo.heads:
+        abixml_repo.heads[gitbranch].checkout(force=True)
+        # Remove anything staged but not committed. Same as "git reset"
+        abixml_repo.git.reset()
+        # Remove untracked files, directories
+        abixml_repo.git.clean('-xdf')
+    else:
+        # If the branch doesn't exist, create it as orphan.
+        # There is no common ancestry of these branches. 
+        abixml_repo.git.checkout(gitbranch,orphan=True)
+        # Make sure the staging area is clean. Remove uncommitted but added files.
+        abixml_repo.git.reset()
+        # Remove untracked files, dirs. Start from pristine repo.
+        abixml_repo.git.clean('-xdf')
+        # Add an empty commit to initialize the branch
+        abixml_repo.git.commit(message="Initial empty commit",allow_empty=True)
+
+    numfiles=len(abixml_repo.git.ls_files().split())
+    logging.info(f'checked out branch {gitbranch} files {numfiles}')
+
+    try:
+        # Process the local RPM given as argument
+        name, version, release, architecture, vendor = extract_rpm_metadata (rpmfile)
+        logging.info(f"Processing RPM {name} : {version} : {release} : {architecture} : {vendor}")
+
+        # Generate the XML ABI information for the RPM and its
+        # debuginfo RPM
+        error, argxmldata = generate_rpm_abixml(rpmfile, temporary_dir, dbg)
+
+        if not argxmldata:
+            if error == NODSO:
+                logging.info (f"RPM {rpmfile} without public DSO. Nothing to add.")
+                return ALLOK
+            elif error == MISSINGFILE:
+                logging.error(f"Could not process RPM: {rpmfile}")
+                return EOTHER
+            else:
+                logging.error(f"Something terrible happened while process RPM: {rpmfile}")
+                return EOTHER
+
+        # Write out the .xml ABI file for the RPM at the correct
+        # location inside the git repo
+        xml_git_path = (gitrepo + "/" + name + "/" + vendor + "/"
+                        + "/" + architecture + "/" + name + "-" + version
+                        + "-" + release + ".xml")
+        xml_git_path = os.path.realpath(xml_git_path)
+        os.makedirs(os.path.dirname(xml_git_path), exist_ok=True)
+        with open(xml_git_path, 'wb') as f:
+            f.write(argxmldata)
+
+        # Do a "git add"
+        abixml_repo.index.add([xml_git_path])
+
+        # Check if the file is new/modified and commit it
+        diff = abixml_repo.index.diff("HEAD")
+        if len(diff) > 0:
+            # customizable
+            c = abixml_repo.index.commit(f"abixml {rpmfile} {release}")
+            logging.info(f'binary {rpmfile} abixml-length {len(argxmldata)} commit {c.hexsha}')
+        else:
+            logging.info(f'binary {rpmfile} abixml-length {len(argxmldata)} unmodified')
+            logging.info(f"File {xml_git_path} already in the repository. Nothing to add")
+        return ALLOK
+
+    except Exception as e:
+        logging.exception(e)
+        return EOTHER
+
+def main():
+    """Main function to parse arguments, open Git repo, and process RPM files."""
+
+    parser = argparse.ArgumentParser(description="Process a RPM to an ABIXML "
+                                     "and push it to a git repo.")
+    parser.add_argument('--loglevel',
+                        choices=["info", "warning", "error", "debug", "critical"],
+                        help = 'Logging level', default = 'info')
+    parser.add_argument('--git', type = str, help = 'ABIXML Git working tree',
+                        required = True)
+    parser.add_argument('--branch',type = str,
+                        help = 'Branch for ABIXML', default = "master")
+    parser.add_argument('--tmpdir', type = str, help=argparse.SUPPRESS)
+    parser.add_argument('--abidw', type = str, help = 'Path to the abidw program',
+                        default = 'abidw')
+    parser.add_argument('--d1', type = str, help = 'Debuginfo RPM for binary RPM file', default = None)
+    parser.add_argument("RPM1", type = str, help = 'Mandatory binary RPM file')
+
+    global args
+    args = parser.parse_args()
+
+    # Set the logging level as specified on the command line,
+    # and set the format the messages
+    logging.basicConfig(level=args.loglevel.upper(),
+                        format="%(filename)s"+": %(levelname)s: %(message)s")
+    logging.captureWarnings(True)
+
+    if args.tmpdir:
+       temporary_dir = args.tmpdir
+       # Check if temporary_dir exists
+       if os.path.exists(temporary_dir):
+          logging.debug(f"Using {temporary_dir} directory for intermediate processing")
+       else:
+          logging.error(f"Argument tmpdir invalid, directory {temporary_dir} doesn't exist")
+          return EOTHER
+    else:
+       temporary_dir = get_temp_directory()
+
+    # Add the XML file for the given RPM to the git repo 
+    with tempfile.TemporaryDirectory(dir=temporary_dir, delete=True) as tmp_dir:
+        return do_add(args.git, args.branch, args.RPM1, tmp_dir, args.d1)
+
+
+if __name__ == '__main__':
+    retvalue = main()
+    exit(retvalue)
