@@ -1,0 +1,44 @@
+From 2b56b0b4b97df35da41e06a2e8fd526e795137ef Mon Sep 17 00:00:00 2001
+From: Alex Burmashev <alexander.burmashev@oracle.com>
+Date: Thu, 12 Jun 2025 13:34:43 +0000
+Subject: [PATCH] Provide built-in deps by modifying python script
+
+Signed-off-by: Alex Burmashev <alexander.burmashev@oracle.com>
+---
+ elvalidated-abi     | 4 ++++
+ elvalidated-abirepo | 4 ++++
+ 2 files changed, 8 insertions(+)
+
+diff --git a/elvalidated-abi b/elvalidated-abi
+index 2aaf743..25d540a 100755
+--- a/elvalidated-abi
++++ b/elvalidated-abi
+@@ -2,6 +2,10 @@
+ # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ # Copyright (C) 2025 Oracle, Inc.
+ 
++import os
++import sys
++import sysconfig
++sys.path.insert(0, os.path.join(sysconfig.get_path('purelib', vars={'platbase': '/usr', 'base': '/usr'}),"elvalidated"))
+ import argparse
+ import libarchive
+ import logging
+diff --git a/elvalidated-abirepo b/elvalidated-abirepo
+index 12b8fec..acc5b19 100755
+--- a/elvalidated-abirepo
++++ b/elvalidated-abirepo
+@@ -2,6 +2,10 @@
+ # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ # Copyright (C) 2025 Oracle, Inc.
+ 
++import os
++import sys
++import sysconfig
++sys.path.insert(0, os.path.join(sysconfig.get_path('purelib', vars={'platbase': '/usr', 'base': '/usr'}),"elvalidated")
+ import argparse
+ import libarchive
+ import logging
+-- 
+2.47.1
+

@@ -1,0 +1,448 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# Copyright (C) 2025 Oracle, Inc.
+
+import argparse
+import libarchive
+import logging
+import tempfile
+import subprocess
+import rpmfile
+import os
+import re
+from difflib import SequenceMatcher
+from typing import List, Tuple
+
+# Values of the bits of the "return code" returned by libabigail's
+# abidiff and abipkgdiff.  Depending on which bit is set, we know what
+# happened in terms of ABI verification.  These bits are documented at
+# https://sourceware.org/libabigail/manual/abidiff.html#return-values.
+# This is for when the compared ABIs are equal
+ABIDIFF_OK = 0
+# In all the other cases (error or differences in ABI) the exit code
+# is a 8-bits-wide bit field in which each bit has a specific meaning
+# Bit 1: This bit is set if there an application error.
+ABIDIFF_ERROR = 1
+# Bit 2: This bit is set if the tool is invoked in an non appropriate
+# manner.
+ABIDIFF_USAGE_ERROR = 1 << 1
+# Bit 4: This bit is set if the ABIs being compared are different.
+ABIDIFF_ABI_CHANGE = 1 << 2
+# Bit 8: This bit is set if the ABIs being compared are different in
+# incompatible way.
+ABIDIFF_ABI_INCOMPATIBLE_CHANGE = 1 << 3
+# Note: ABIDIFF_ABI_INCOMPATIBLE_CHANGE is set only if one or both of
+# the following two cases is true:
+# - removal of the symbol of a# function or variable that has been
+#   defined and exported.
+# - modification of the index of a member of a virtual function table
+#   (for C++ programs and libraries).
+
+
+# Return codes from this script
+# Given RPM is compatible with distro
+COMPATIBLE = 0
+# Given RPM is not compatible with distro
+NOTCOMPATIBLE = 256
+# Not a valid comparison, the Versions must match
+EINVAL = 22
+# There is no corresponding XML file stored in the XML tree
+EEXIST = 17
+# Other error or internal error
+EOTHER = 1
+
+# globals
+args = None
+
+def get_temp_directory():
+    """Determine an appropriate temporary directory to do 
+    intermediate processing based on environment."""
+
+    # Check if ABITMPDIR environment variable is set
+    tmp_dir = os.environ.get('ABITMPDIR')
+    if tmp_dir:
+        logging.debug(f"Using ABITMPDIR environment variable"
+                      f" for intermediate processing: {tmp_dir}")
+        return tmp_dir
+
+    # Check if /tmp exists
+    if os.path.exists('/tmp'):
+        logging.debug(f"Using /tmp directory for intermediate processing")
+        return '/tmp'
+
+    # Default to current working directory
+    tmp_dir = os.getcwd()
+    logging.debug(f"Using current working directory"
+                  f" for intermediate processing: {tmp_dir}")
+    return tmp_dir
+
+def extract_rpm(archive, temporary_dir):
+    """Extracts an RPM archive to a temporary directory.
+
+    Args:
+        archive (str): Path to the RPM archive.
+
+    Returns:
+        str: Path to the extracted directory.
+    """
+
+    logging.debug(f"Extract {archive} to {temporary_dir}")
+    try:
+        # First command: rpm2cpio ARCHIVE
+        rpm2cpio_process = subprocess.Popen(["rpm2cpio", archive],
+                                            stdout=subprocess.PIPE)
+
+        # Second command: cpio -idmvD TMPDIR, reading from the
+        # first command's output
+        cpio_process = subprocess.Popen(["cpio", "--quiet", "-idmD", temporary_dir],
+                                        stdin=rpm2cpio_process.stdout)
+
+        # Close the output of rpm2cpio to leti the cpio process knowi
+        # no more data will be piped in
+        rpm2cpio_process.stdout.close()
+
+        # Wait for the cpio command to finish
+        cpio_process.communicate()
+
+        logging.debug(f"Extraction completed.")
+        return temporary_dir
+
+    except subprocess.CalledProcessError as err:
+        logging.error(f"An error occurred during extraction: {err}")
+        return None
+
+
+def extract_rpm_metadata(rpm_path):
+    """Extracts RPM metadata (name, version, release, architecture,
+    vendor).
+
+    Args:
+        rpm_path (str): Path to the RPM file.
+
+    Returns:
+        tuple: Contains the name, version, release, architecture,
+               and vendor of the RPM.
+    """
+    try:
+        # Open the RPM file
+        with rpmfile.open(rpm_path) as rpm:
+            # Extract required fields
+            name = rpm.headers.get('name').decode("utf-8")
+            version = rpm.headers.get('version').decode("utf-8")
+            release = rpm.headers.get('release').decode("utf-8")
+            architecture = rpm.headers.get('arch').decode("utf-8")
+            vendor = rpm.headers.get('vendor').decode("utf-8").partition(' ')[0]
+
+        return name, version, release, architecture, vendor
+    except Exception as e:
+        logging.error(f"Error reading RPM file: {e}")
+        return None
+
+def get_public_dso_sonames_set(rpm_file):
+    """Build a set of public DSOs as advertised in the package's
+    'provides' property.
+
+    Args:
+        rpm_file (str): binary RPM file.
+
+    Returns:
+        list[str]: Sorted, unique list of public DSOs.
+    """
+    try:
+        # Run the command to get the provides information from the RPM
+        result = subprocess.run(
+            ["rpm", "-qp", "--provides", rpm_file, "--nosignature"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+
+        # Filter lines containing '.so', extract relevant part, and
+        # process the output
+        provides = result.stdout.splitlines()
+        libraries = set()
+        for line in provides:
+            if ".so" in line:
+                # Extract part before '(' and trim whitespace
+                library = line.split("(")[0].strip()
+                libraries.add(library)
+
+        return sorted(libraries)
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Error executing rpm command: {e}")
+        return []
+    except Exception as e:
+        logging.error(f"Unexpected error: {e}")
+        return []
+
+def default_dbginfo_name(rpm_path):
+    """Use the input RPM to derive its coresponding debuginfo RPM
+
+    Returns: None or the debuginfo RPM
+    """
+
+    name, version, release, architecture, vendor = extract_rpm_metadata (rpm_path)
+    rpmdir = os.path.dirname (rpm_path)
+    if not rpmdir:
+        rpmdir = "."
+    dbginfo = (rpmdir + "/" + name + "-debuginfo-" +
+               version + "-" + release + "." +
+               architecture + ".rpm")
+
+    if not os.path.isfile(dbginfo):
+        logging.error (f"RPM file {dbginfo} does not exist")
+        return None
+    return dbginfo
+
+def generate_rpm_abixml(rpm_path, temporary_dir, dbginfo=None):
+    """Processes a binary RPM file, extracting matching .so files and
+    generating its ABIXML file, namely the ABI of the RPM.
+
+    Args:
+        rpm_path (str): Path to the binary RPM file.
+
+    Returns:
+        bytes: The output of the ABIXML processing.
+    """
+
+    if not os.path.isfile (rpm_path):
+        logging.error (f"Error reading RPM file: {rpm_path}")
+        return None
+
+    # If there is no debuginfo RPM argument given, infer its name
+    # from the binary RPM name
+    if not dbginfo:
+        dbginfo = default_dbginfo_name(rpm_path)
+
+    # Expand debuginfo RPM
+    debuginfo_rootdir = extract_rpm (dbginfo, temporary_dir)
+    # Get full path to debuginfo
+    dbg_dir = os.path.join(debuginfo_rootdir, "usr", "lib", "debug")
+
+    # Expand binary RPM
+    elf_dir = extract_rpm (rpm_path, temporary_dir)
+
+    # Get the list of public DSOs
+    dso_list = get_public_dso_sonames_set(rpm_path)
+
+    # List to store relative paths of matching files
+    matching_files = []
+
+    # Build regular expression to match for shared libs names
+    rf = re.compile(r"\.so(\.\d+)*$")
+
+    # Walk through the tree os the expanded binary RPM
+    # processing the shared libaries only. 
+    # Skip over private shared libraries (they are not part of the ABI)
+    for root, dirs, files in os.walk(elf_dir):
+        dirs[:] = [d for d in dirs if not d[0] == '.']
+        for file in files:
+            logging.debug(f"Processing file {file}")
+            file_path = os.path.join(root, file)
+            # Calculate the relative path and add it to the list
+            relative_path = os.path.relpath(file_path, elf_dir)
+            if rf.search(file):
+                if file in dso_list:
+                    logging.debug(f"Adding DSO file {file}")
+                    matching_files.append(relative_path)
+                else:
+                    logging.debug (f"DSO {file} seems to be private. Skipping it")
+
+    if matching_files:
+        all_so = ",".join(matching_files[:-1]) if len(matching_files) > 1 else matching_files[0]
+    else:
+        logging.info (f"No shared libaries in RPM to process")
+        return None
+
+    # Now that we have a list of public shared libraries, run abidw to get the ABIXML
+
+    # Libabigail's ABIDW program reads a shared library (or a list of shared libraries) in ELF 
+    # format and emits an XML representation of its ABI to standard output. 
+    # The emitted representation format, named ABIXML, includes all the globally defined functions
+    # and variables, along with a complete representation of their types. 
+
+    cmdline = [args.abidw, "--no-corpus-path", "--debug-info-dir", dbg_dir,
+               "--add-binaries=" + all_so, matching_files[-1] ]
+    logging.debug(f"Running {cmdline}")
+    result = subprocess.run (cmdline, cwd=elf_dir, # Hack for abidw to work with multiple bins
+                             capture_output = True, check = False)
+    if (result.returncode != 0):
+        logging.error(f"abidw error:\n{result.stdout.decode('utf-8')}\n{result.stderr.decode('utf-8')}")
+        raise RuntimeError(f"abidw failure {result.returncode} {rpm_path}")
+
+    if len(result.stderr) > 0:
+        logging.warning(f"abidw error:{rpm_path}\n{result.stderr}")
+
+    return result.stdout
+
+def walk_dir (name, dirname, srch):
+    verel_list = []
+    # Now search for something which looks like: NAME-VER-(.*)
+    rf = re.compile(rf'{name}-{srch}-(.*)\.xml')
+    # Walk through directory tree
+    for root, _, files in os.walk(dirname):
+        for file in files:
+            m = re.match(rf,file)
+            if m:
+                verel_list.append(srch + "-" + m.group(1))
+                logging.debug (f"VERREL: {m.group(1)}")
+
+    return verel_list
+
+def do_abidiff(rpm_file, temporary_dir, dbg=None):
+    # Open the DIR repo
+    args.dir = os.path.realpath(args.dir) # canonicalize
+    if not os.path.isdir(args.dir):
+        logging.error(f"No ABIXML directory found.")
+        parser.print_usage()
+        exit(EEXIST)
+
+    try:
+        # Process the local RPM given as argument
+        name, version, release, architecture, vendor = extract_rpm_metadata (rpm_file)
+        release = release.split(".", 1)[0]
+        logging.info(f"Processing RPM {name} : {version} : {release} : {architecture} : {vendor}")
+        # Generate the XML ABI information for the RPM and its
+        # debuginfo RPM
+        argxmldata = generate_rpm_abixml(rpm_file, temporary_dir, dbg)
+
+        if not argxmldata:
+            logging.error(f"Could not process RPM: {rpm_file}")
+            return EEXIST
+
+        # Write out the .xml ABI file for the RPM
+        argpath = (temporary_dir + "/" + name + "-" + version + ".xml")
+        argpath = os.path.realpath(argpath)
+        os.makedirs(os.path.dirname(argpath), exist_ok=True)
+        with open(argpath, 'wb') as f:
+            f.write(argxmldata)
+
+        # Construct the path to the XML file which we want to check
+        # against, stored in the given tree/repo
+        storedxmlpath = (args.dir + "/" + name + "/OpenELA/"
+                   + "/" + architecture + "/")
+        if not os.path.isdir(storedxmlpath):
+            logging.error (f"Cannot find folder: {storedxmlpath}")
+            return EEXIST
+
+        # Now search for something which looks like: NAME-VER-(.*)
+        rf = re.compile(rf'{name}-{version}-{release}(.*)\.xml')
+        # Walk through directory tree in the repo, in the subtree
+        # corresponding to the given vendor, OS, arch and name.
+        foundfile = ''
+        for root, _, files in os.walk(storedxmlpath):
+            oldscore = 0
+            for file in files:
+                m = re.match(rf,file)
+                if m:
+                    diffscore = SequenceMatcher(None, m.group(1), release).ratio()
+                    logging.debug(f"File {file} Score {diffscore}")
+                    if diffscore >= oldscore:
+                        logging.debug(f"+->Selected File {file}")
+                        foundfile = file
+                        oldscore = diffscore
+
+        storedxmlfile = storedxmlpath
+        storedxmlfile += "/" + foundfile
+
+        if not os.path.isfile (storedxmlfile):
+            logging.error (f"File {storedxmlfile} not found")
+            return EEXIST
+
+        logging.info(f"Comparing the ABI of binaries between {storedxmlfile} and {rpm_file}")
+
+        # Run the diff command
+        cmdline = [args.abidiff,
+                   '--no-added-syms',
+                   '--no-unreferenced-symbols',
+                   '--leaf-changes-only',
+                   '--impacted-interfaces',
+                   storedxmlfile, argpath]
+        logging.debug ('Run: %s', ' '.join(cmdline))
+        result = subprocess.run(cmdline,
+                                capture_output = True, check = False)
+        has_no_abi_change = result.returncode == ABIDIFF_OK
+        has_internal_error = result.returncode & ABIDIFF_ERROR or result.returncode & ABIDIFF_USAGE_ERROR
+        has_abi_compatible_change = result.returncode & ABIDIFF_ABI_CHANGE
+        has_abi_incompatible_change = result.returncode & ABIDIFF_ABI_INCOMPATIBLE_CHANGE
+        logging.debug(f"{result.stdout.decode('utf-8')}\n{result.stderr.decode('utf-8')}")
+
+        # Cleanup of the ABI xml file generated for the given RPM argument
+        os.remove (os.path.abspath (argpath))
+
+        if has_internal_error:
+            return EOTHER
+        if has_abi_incompatible_change:
+            print()
+            print(result.stdout.decode('utf-8'))
+            return NOTCOMPATIBLE
+        if has_abi_compatible_change:
+            logging.warning(f"An ABI change that needs human review")
+        return COMPATIBLE
+
+    except Exception as e:
+        logging.exception(e)
+        return EOTHER
+
+def main():
+    """Main function to parse arguments, open the directory containing
+       the XML files, and compare the input RPM against the
+       corresponding XML file in the directory.
+
+    """
+
+    parser = argparse.ArgumentParser(description="Manipulate an ABIXML of a given "
+                                     "package.")
+    parser.add_argument('--loglevel',
+                        choices=["info", "warning", "error", "debug", "critical"],
+                        help = 'Logging level', default = 'critical')
+    parser.add_argument('--dir', type = str, help = 'ABIXML files directory', 
+                        default = '../gitxml')
+    parser.add_argument('--tmpdir', type = str, help = argparse.SUPPRESS)
+    parser.add_argument('--abidw', type = str, help = 'Path to the abidw program',
+                        default = 'abidw')
+    parser.add_argument('--abidiff', type = str, help = 'Path to the abidiff program',
+                        default = 'abidiff')
+    parser.add_argument('--d1', type = str, help = 'Debuginfo RPM for binary RPM file', default = None)
+    parser.add_argument("RPM1", type = str, help = 'Mandatory binary RPM file')
+
+    global args
+    args = parser.parse_args()
+
+    # Set the logging level as specified on the command line,
+    # and set the format the messages 
+    logging.basicConfig(level=args.loglevel.upper(),
+                        format="%(filename)s"+": %(levelname)s: %(message)s")
+    logging.captureWarnings(True)
+
+    if args.tmpdir:
+       temporary_dir = args.tmpdir
+       # Check if temporary_dir exists
+       if os.path.exists(temporary_dir):
+          logging.debug(f"Using {temporary_dir} directory for intermediate processing")
+       else:
+          logging.error(f"Argument tmpdir invalid, directory {temporary_dir} doesn't exist")
+          return EOTHER
+    else:
+       temporary_dir = get_temp_directory()
+
+    with tempfile.TemporaryDirectory(dir=temporary_dir) as tmp_dir:
+        return do_abidiff(args.RPM1, tmp_dir, args.d1)
+
+
+if __name__ == '__main__':
+    result = main()
+    if result == EINVAL:
+        print("Compared RPMs versions must match")
+    elif result == EEXIST:
+        print("Could not find corresponding ABI XML file in XML tree ")
+    elif result == NOTCOMPATIBLE:
+        print("Not compatible RPM")
+    elif result == COMPATIBLE:
+        print("Compatible RPM")
+    elif result == EOTHER:
+        print("Internal error")
+    else:
+        print("Unknown error")
+    exit(result)
+
