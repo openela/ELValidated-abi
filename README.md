@@ -1,7 +1,7 @@
 
 # Table of Contents
 
-1.  [A tool for checking an RPM packages](#distrocompat)
+1.  [A tool for checking an RPM packages](#elverify-abi)
 2.  [A tool for submitting an ABI XML to a git repo](#abirepo)
 
 # A git repository for archiving RPM ABI XMLs
@@ -39,9 +39,9 @@ Example:
 <a id="dsitrocompat"></a>
 # A tool for checking distro RPM packages
 
-## DISTROCOMPAT
+## elverify-abi
 
-DISTROCOMPAT is a script built around libabigail tools that
+elverify-abi is a script built around libabigail tools that
 quickly checks either if a RPM is compatible against a Vendor distro.
 
 ### Comparing rpm Vs XML DB folder
@@ -56,10 +56,10 @@ quickly checks either if a RPM is compatible against a Vendor distro.
 
 Example: Compare against a Rocky RPM
 
-$distrocompat glibc-2.34-100.el9_4.4.x86_64.rpm
+$elverify-abi glibc-2.34-100.el9_4.4.x86_64.rpm
 Compatible
 
-Observations: The distrocompat tool will employ first the Vendor
+Observations: The elverify-abi tool will employ first the Vendor
  selection, namely, it searches for a Rocky version of glibc, and, if
  it is not found, a default one (in our exercise is Oracle) is chosen.
  Next, the tool will employ a heuristic to match the closest
@@ -68,12 +68,12 @@ Observations: The distrocompat tool will employ first the Vendor
 
 ### Returning Values
 
-DISTROCOMPAT returns the next values
+elverify-abi returns the next values
 
 | Mnemonic | Value | Meaning |
 |----------|-------|---------|
 | COMPATIBLE | 0 | The analysis is successful, the package(s) are compatible |
-| NOTCOMPATILBE| -1 | The package(s) are not compatible |
+| NOTCOMPATILBE| 256 | The package(s) are not compatible |
 | EINVAL | 22 | Versions must match |
 | EEXIST | 17 | An error is detected while accessing ABI XML DB |
 | EOTHER  | 1  | An internal error is detected |

@@ -43,7 +43,7 @@ ABIDIFF_ABI_INCOMPATIBLE_CHANGE = 1 << 3
 # Given RPM is compatible with distro
 COMPATIBLE = 0
 # Given RPM is not compatible with distro
-NOTCOMPATIBLE = -1
+NOTCOMPATIBLE = 256
 # Not a valid comparison, the Versions must match
 EINVAL = 22
 # There is no corresponding XML file stored in the XML tree
