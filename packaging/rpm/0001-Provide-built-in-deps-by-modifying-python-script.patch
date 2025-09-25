@@ -35,7 +35,7 @@ index 12b8fec..acc5b19 100755
 +import os
 +import sys
 +import sysconfig
-+sys.path.insert(0, os.path.join(sysconfig.get_path('purelib', vars={'platbase': '/usr', 'base': '/usr'}),"elvalidated")
++sys.path.insert(0, os.path.join(sysconfig.get_path('purelib', vars={'platbase': '/usr', 'base': '/usr'}),"elvalidated"))
  import argparse
  import libarchive
  import logging
